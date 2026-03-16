@@ -1,4 +1,8 @@
 # Template-LaTeX-MSc-PUC
+
+## Automotive Car Photo Editor (Flask)
+
+For the Python car photo editor app added in this branch, see `README_APP.md` for local setup and launch instructions.
 ## Descripción
 El template <i>Thesis.tex</i> y la clase <i>pucthesis.cls</i> han sido diseñados para facilitar la labor de escritura de tesis del Magister en Ciencias de Ingeniería de la Pontificia Universidad Católica de Chile.
 
