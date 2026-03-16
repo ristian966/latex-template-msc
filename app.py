@@ -14,18 +14,9 @@ _session = None
 _session_lock = threading.Lock()
 
 
-def refine_alpha_mask(alpha_channel: np.ndarray) -> np.ndarray:
-    # Close tiny gaps in the alpha mask first to reduce pinholes around edges.
-    alpha_img = Image.fromarray(alpha_channel, mode="L")
-    alpha_img = alpha_img.filter(ImageFilter.MaxFilter(3)).filter(ImageFilter.MinFilter(3))
-    alpha = np.array(alpha_img, dtype=np.uint8)
-
-    foreground = alpha > 10
-    background = ~foreground
-    if not np.any(background):
-        return alpha
-
-    h, w = alpha.shape
+def _find_exterior_background(background: np.ndarray) -> np.ndarray:
+    """Mark all background pixels connected to the image border."""
+    h, w = background.shape
     reachable = np.zeros((h, w), dtype=bool)
     stack = []
 
@@ -49,13 +40,94 @@ def refine_alpha_mask(alpha_channel: np.ndarray) -> np.ndarray:
         reachable[y, x] = True
         stack.extend(((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)))
 
+    return reachable
+
+
+def count_enclosed_hole_pixels(alpha_channel: np.ndarray, threshold: int = 18) -> int:
+    foreground = alpha_channel > threshold
+    background = ~foreground
+    if not np.any(background):
+        return 0
+
+    reachable = _find_exterior_background(background)
+    holes = background & ~reachable
+    return int(holes.sum())
+
+
+def refine_alpha_mask_legacy(alpha_channel: np.ndarray) -> np.ndarray:
+    alpha_img = Image.fromarray(alpha_channel, mode="L")
+    alpha_img = alpha_img.filter(ImageFilter.MaxFilter(3)).filter(ImageFilter.MinFilter(3))
+    alpha = np.array(alpha_img, dtype=np.uint8)
+
+    foreground = alpha > 10
+    background = ~foreground
+    if not np.any(background):
+        return alpha
+
+    h, _ = alpha.shape
+    reachable = _find_exterior_background(background)
     holes = background & ~reachable
     if not np.any(holes):
         return alpha
 
-    visited = np.zeros((h, w), dtype=bool)
+    visited = np.zeros((h, alpha.shape[1]), dtype=bool)
     max_hole_area = max(200, int(alpha.size * 0.045))
     min_hole_area = 60
+
+    ys, xs = np.where(holes)
+    for start_y, start_x in zip(ys.tolist(), xs.tolist()):
+        if visited[start_y, start_x]:
+            continue
+
+        component_pixels = []
+        local_stack = [(start_y, start_x)]
+        while local_stack:
+            y, x = local_stack.pop()
+            if y < 0 or y >= h or x < 0 or x >= alpha.shape[1]:
+                continue
+            if visited[y, x] or not holes[y, x]:
+                continue
+            visited[y, x] = True
+            component_pixels.append((y, x))
+            local_stack.extend(((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)))
+
+        area = len(component_pixels)
+        if area < min_hole_area or area > max_hole_area:
+            continue
+
+        rows = [p[0] for p in component_pixels]
+        if (sum(rows) / area) > h * 0.82:
+            continue
+
+        for y, x in component_pixels:
+            alpha[y, x] = max(alpha[y, x], 235)
+
+    return alpha
+
+
+def refine_alpha_mask_modern(alpha_channel: np.ndarray) -> np.ndarray:
+    alpha_img = Image.fromarray(alpha_channel, mode="L")
+    smoothed_alpha = np.array(alpha_img.filter(ImageFilter.GaussianBlur(0.55)), dtype=np.uint8)
+
+    # Close narrow cut-through gaps so transparent windows are treated as enclosed regions.
+    alpha_img = Image.fromarray(smoothed_alpha, mode="L")
+    alpha_img = alpha_img.filter(ImageFilter.MaxFilter(7)).filter(ImageFilter.MinFilter(7))
+    alpha = np.array(alpha_img, dtype=np.uint8)
+
+    foreground = alpha > 6
+    background = ~foreground
+    if not np.any(background):
+        return smoothed_alpha
+
+    reachable = _find_exterior_background(background)
+    h, w = alpha.shape
+    holes = background & ~reachable
+    if not np.any(holes):
+        return smoothed_alpha
+
+    visited = np.zeros((h, w), dtype=bool)
+    max_hole_area = max(200, int(alpha.size * 0.22))
+    min_hole_area = 20
 
     ys, xs = np.where(holes)
     for start_y, start_x in zip(ys.tolist(), xs.tolist()):
@@ -78,15 +150,26 @@ def refine_alpha_mask(alpha_channel: np.ndarray) -> np.ndarray:
         if area < min_hole_area or area > max_hole_area:
             continue
 
-        rows = [p[0] for p in component_pixels]
-        # Prioritize enclosed regions where cabin glass typically appears.
-        if (sum(rows) / area) > h * 0.82:
-            continue
-
         for y, x in component_pixels:
-            alpha[y, x] = max(alpha[y, x], 235)
+            smoothed_alpha[y, x] = max(smoothed_alpha[y, x], 242)
 
-    return alpha
+    # Keep interior body details opaque while preserving anti-aliased edges.
+    interior = Image.fromarray((foreground.astype(np.uint8) * 255), mode="L")
+    interior = interior.filter(ImageFilter.MinFilter(9))
+    interior_mask = np.array(interior, dtype=np.uint8) > 127
+    smoothed_alpha[interior_mask] = np.maximum(smoothed_alpha[interior_mask], 225)
+
+    return np.array(Image.fromarray(smoothed_alpha, mode="L").filter(ImageFilter.GaussianBlur(0.45)), dtype=np.uint8)
+
+
+def refine_alpha_mask(alpha_channel: np.ndarray) -> np.ndarray:
+    modern = refine_alpha_mask_modern(alpha_channel)
+    legacy = refine_alpha_mask_legacy(alpha_channel)
+
+    # Some cars/images behave better with stricter legacy hole handling.
+    if count_enclosed_hole_pixels(modern) <= count_enclosed_hole_pixels(legacy):
+        return modern
+    return legacy
 
 
 def get_rembg_session():
@@ -129,9 +212,9 @@ def remove_bg():
             normalized_png,
             session=get_rembg_session(),
             alpha_matting=True,
-            alpha_matting_foreground_threshold=240,
-            alpha_matting_background_threshold=16,
-            alpha_matting_erode_size=10,
+            alpha_matting_foreground_threshold=235,
+            alpha_matting_background_threshold=8,
+            alpha_matting_erode_size=3,
             post_process_mask=True,
         )
 
