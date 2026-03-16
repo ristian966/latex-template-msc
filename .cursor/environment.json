@@ -1,0 +1,10 @@
+{
+  "install": "bash .cursor/install_python_deps.sh",
+  "persistedDirectories": [
+    "/home/ubuntu/.cache/pip",
+    "/home/ubuntu/.u2net"
+  ],
+  "env": {
+    "PYTHONUNBUFFERED": "1"
+  }
+}
